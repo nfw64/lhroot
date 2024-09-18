@@ -1,15 +1,18 @@
 #!/system/bin/sh
 
-# if busybox is not found, exit
-if ! command -v busybox >/dev/null 2>&1; then
-    echo "Busybox not found!  Install it, dummy!"
-    log "Busybox not found!  Install it, dummy!"
-    exit 1
+if [ -x /system/xbin/busybox ]; then
+	busybox=/system/xbin/busybox
+elif [ -x /system/bin/busybox ]; then
+	busybox=/system/bin/busybox
+elif [ -x /data/adb/ap/bin/busybox ]; then
+    busybox=/data/adb/ap/bin/busybox
+elif [ -x "$(command -v foo)" ]; then
+  readlink -f $(which busybox)
+else
+	echo "Busybox not found!  Install it, dummy!"
+	log "Busybox not found!  Install it, dummy!"
+	exit
 fi
-
-busybox=$(command -v busybox)
-sdkVer="$(getprop ro.system.build.version.sdk)"
-
 export bin=/system/bin
 if [ -n "$1" ]; then
     if [ -d "$1" ]; then
@@ -42,7 +45,8 @@ fi
 
 ########## Kill all running linux services and processes ##########
 kill_pids() {
-    bllog "[!] Killing all running linux services .."
+    log "[INFO] Killing all running linux services .."
+    do_sysv_stop
     local lsof_full=$($busybox lsof | awk '{print $1}' | grep -c '^lsof')
     if [ "${lsof_full}" -eq 0 ]; then
         local pids=$($busybox lsof | grep "$mnt" | awk '{print $1}' | uniq)
@@ -56,6 +60,54 @@ kill_pids() {
     return 0
 }
 
+is_ok()
+{
+    if [ $? -eq 0 ]; then
+        if [ -n "$2" ]; then
+            echo "$2"
+        fi
+        return 0
+    else
+        if [ -n "$1" ]; then
+            echo "$1"
+        fi
+        return 1
+    fi
+}
+
+#####.   CHROOT EXEC #######
+chroot_exec()
+{
+    unset TMP TEMP TMPDIR LD_PRELOAD LD_DEBUG
+    local path="${PATH}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  chroot "$mnt" /bin/su - root -c "$*"
+}
+#########    SYSV    #########
+do_sysv_stop() {
+
+    [ -n "${INIT_LEVEL}" ] || return 0
+
+    local services=$(ls "$mnt/etc/rc3.d/" | grep '^S')
+    if [ -n "${services}" ]; then
+        echo "[INFO] Killing SysV "
+        local item
+        for item in ${services}
+        do
+            if [ "${INIT_ASYNC}" = "true" ]; then
+                echo "[INFO] stopping ${item/S[0-9][0-9]/}"
+                chroot_exec "/etc/rc${INIT_LEVEL}.d/${item} stop" 1>&2 &
+            else
+                echo "[INFO] stopping ${item/S[0-9][0-9]/}"
+                chroot_exec "/etc/rc${INIT_LEVEL}.d/${item} stop" 1>&2
+            fi
+            is_ok "[#] ${item/S[0-9][0-9]/} failed" "[+] ${item/S[0-9][0-9]/}"
+        done
+    fi
+
+    return 0
+}
+
+
 PRESERVED_PATH=$PATH
 export PATH=/usr/bin:/usr/sbin:/bin:/usr/local/bin:/usr/local/sbin:$PATH
 export TERM=linux
@@ -63,41 +115,41 @@ export HOME=/root
 export LOGNAME=root
 unset LD_PRELOAD
 
-echo "Shutting down SSH Server"
-$busybox chmod 666 /dev/null
+echo "Shutting down SSH Server" &> /dev/null
+$busybox chmod 666 /dev/null &> /dev/null
 
-$busybox chroot $mnt /etc/init.d/sshd stop
+$busybox chroot $mnt /etc/init.d/sshd stop &> /dev/null
 
-echo "Shutting down Postgresql"
-$busybox chroot $mnt /etc/init.d/postgresql stop
+echo "Shutting down Postgresql" &> /dev/null
+$busybox chroot $mnt /etc/init.d/postgresql stop &> /dev/null
 
-echo "Shutting down Apache2"
-$busybox chroot $mnt /etc/init.d/apache2 stop
+echo "Shutting down Apache2" &> /dev/null
+$busybox chroot $mnt /etc/init.d/apache2 stop &> /dev/null
 
-echo "Kill all Linux services and processes"
+echo "[INFO] Kill all Linux services and processes"
 kill_pids
 
 # unmount everything
 
-echo "Removing all Linux mounts"
-$busybox umount $mnt/dev/pts && echo "unmounted pts"
-$busybox umount $mnt/dev && echo "unmounted dev"
-$busybox umount $mnt/proc && echo "unmounted proc"
-$busybox umount $mnt/sys && echo "unmounted sys"
-$busybox umount $mnt/system && echo "unmounted system"
-$busybox umount $mnt/sdcard && echo "unmounted sdcard"
-$busybox umount $mnt/external_sd && echo "unmounted external_sd"
-$busybox umount $mnt/data/data && echo "unmounted data/data"
-$busybox umount $mnt/data/dalvik-cache && echo "unmounted data/dalvik-cache"
-$busybox umount $mnt/linkerconfig && echo "unmounted linkerconfig"
-
-if [ $sdkVer -ge 29 ]; then
-    cd "$mnt/apex"
-    for f in *; do
-        $busybox umount "$mnt/apex/$f" && echo "unmounted apex/$f"
-    done
-    cd - 2>&1 > /dev/null
+echo "[INFO] Removing all Linux mounts"
+$busybox umount $mnt/dev/pts && echo "[+] unmounted pts"
+$busybox umount $mnt/proc && echo "[+] unmounted proc"
+$busybox umount $mnt/sys && echo "[+] unmounted sys"
+$busybox umount -l $mnt/system && echo "[+] unmounted system"
+$busybox umount $mnt/sdcard && echo "[+] unmounted sdcard"
+if [ -b "/dev/mmcblk0p1/" ]
+then
+$busybox umount $mnt/external_sd && echo "[+] unmounted external_sd"
 fi
+$busybox umount -l $mnt/data/data && echo "[+] unmounted data/data"
+$busybox umount -l $mnt/data/dalvik-cache && echo "[+] unmounted data/dalvik-cache"
+$busybox umount $mnt/linkerconfig && echo "[+] unmounted linkerconfig"
 
+cd "$mnt/apex"
+for f in *; do
+    $busybox umount "$mnt/apex/$f" && echo "[+] unmounted apex/$f"
+done
+cd - 2>&1 > /dev/null
+$busybox umount -l $mnt/dev && echo "[+] unmounted dev"
 export PATH=$PRESERVED_PATH
 

@@ -1,30 +1,34 @@
 #!/system/bin/sh
 
-# if busybox is not found, exit
-if ! command -v busybox >/dev/null 2>&1; then
-    echo "Busybox not found!  Install it, dummy!"
-    log "Busybox not found!  Install it, dummy!"
-    exit 1
+if [ -x /system/xbin/busybox ]; then
+	busybox=/system/xbin/busybox
+elif [ -x /system/bin/busybox ]; then
+	busybox=/system/bin/busybox
+elif [ -x /data/adb/ap/bin/busybox ]; then
+    busybox=/data/adb/ap/bin/busybox
+elif [ -x "$(command -v foo)" ]; then
+    readlink -f $(which busybox)
+else
+	echo "[ERR] Busybox not found!  Install it, dummy!"
+	log "[ERR] Busybox not found!  Install it, dummy!"
+	exit 1
 fi
-
-busybox=$(command -v busybox)
 
 ######### CHECK FOR ROOT #########
 f_checkforroot(){
 	perm=$(id | $busybox cut -b 5)
     if [ "$perm" != "0" ]; then
-		echo "ROOT NOT DETECTED! Type su first before executing this script"
+		echo "[ERR] ROOT NOT DETECTED! Type su first before executing this script"
 		exit 1
 	fi
 }
-
 ######### VARIABLES #########
 mnt=
 if [ -n "$1" ]; then
     if [ -d "$1" ]; then
         mnt=$1
     else
-        echo "Directory $1 does not found"
+        echo "[ERR] Directory $1 does not found"
         exit 1
     fi
 elif [ -d "/data/alpine" ]; then
@@ -44,9 +48,57 @@ elif [ -d "/data/manjaro" ]; then
 elif [ -d "/data/void" ]; then
     mnt=/data/void
 else
-    echo "No chroot installed";
+    echo "[INFO] No chroot installed";
     exit 1
 fi
+
+is_ok()
+{
+    if [ $? -eq 0 ]; then
+        if [ -n "$2" ]; then
+            echo "$2"
+        fi
+        return 0
+    else
+        if [ -n "$1" ]; then
+            echo "$1"
+        fi
+        return 1
+    fi
+}
+
+#####.   CHROOT EXEC #######
+chroot_exec()
+{
+    unset TMP TEMP TMPDIR LD_PRELOAD LD_DEBUG
+    local path="${PATH}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  chroot "$mnt" /bin/su - root -c "$*"
+}
+#########    SYSV    #########
+do_sysv() {
+
+    [ -n "${INIT_LEVEL}" ] || return 0
+    
+    local services=$(ls "$mnt/etc/rc3.d/" | grep '^S')
+    if [ -n "${services}" ]; then
+        echo "[INFO] Starting SysV"
+        local item
+        for item in ${services}
+        do
+            if [ "${INIT_ASYNC}" = "true" ]; then
+                echo "[INFO] ${item/S[0-9][0-9]/} is starting"
+                chroot_exec "/etc/rc${INIT_LEVEL}.d/${item} start" 1>&2 &
+            else
+                echo "[INFO] ${item/S[0-9][0-9]/} is starting"
+                chroot_exec "/etc/rc${INIT_LEVEL}.d/${item} start" 1>&2
+            fi
+            is_ok "[#] ${item/S[0-9][0-9]/} failed" "[+] ${item/S[0-9][0-9]/}"
+        done
+    fi
+
+    return 0
+}
+
 ######### CHECK FOR INSTALL #########
 # There is a bug that will create the resolv.conf
 # If we continue on with bootlinux even after we
@@ -145,7 +197,7 @@ mount_linux_chroot() {
         mkdir -p $mnt/apex
         cd "/apex"
         for f in *; do
-            mkdir -p "$mnt/apex/$f"
+            mkdir -p "$mnt/apex/$f" &> /dev/null
         done
         cd - 2>&1 > /dev/null
     fi
@@ -213,15 +265,15 @@ mount_linux_chroot() {
     # Android
 
     ######### MOUNT APEX #######
-    if [ $sdkVer -ge 29 ]; then
+   if [ $sdkVer -ge 29 ]; then
         grep "$mnt/apex" /proc/mounts -q 2>&1 > /dev/null
         if [[ "$?" -ne 0 ]]; then
-            cd /apex
-            for f in *; do
-                $busybox mount --rbind "/apex/$f" "$mnt/apex/$f" && bllog "[+] mounted /apex/$f"
-            done
-        fi
-    fi
+           cd /apex
+           for f in *; do
+               $busybox mount --rbind "/apex/$f" "$mnt/apex/$f" && bllog "[+] mounted /apex/$f"
+           done
+       fi
+   fi
 
     ####### MOUNT DATA ########
     if [ ! "$(mountpoint $mnt/data/data 2> /dev/null | grep 'is a')" ]; then
@@ -248,9 +300,10 @@ mount_linux_chroot() {
     fi
 
     #enable depmod/modprobe support in rootfs
-    if [ ! "$(mountpoint $mnt/lib/modules 2> /dev/null | grep 'is a')" ]; then
-       $busybox mount -r -o bind /system/lib/modules $mnt/lib/modules && bllog "[+] mounted /lib/modules"
-    fi
+    
+   #if [ ! "$(mountpoint $mnt/lib/modules 2> /dev/null | grep 'is a')" ]; then
+   #    $busybox mount -r -o bind /system/lib/modules $mnt/lib/modules && bllog "[+] mounted /lib/modules"
+   # fi
 
     ######### MOUNT INTERNAL | EXTERNAL SDCARD | USBDISK ########
     mount_sdcard
@@ -276,28 +329,55 @@ mount_linux_chroot() {
     sed "/export DEX2OATBOOTCLASSPATH=\"/d" -i "$mnt/etc/profile"
     echo "export DEX2OATBOOTCLASSPATH=\"/apex/com.android.art/javalib/core-oj.jar:/apex/com.android.art/javalib/core-libart.jar:/apex/com.android.art/javalib/okhttp.jar:/apex/com.android.art/javalib/bouncycastle.jar:/apex/com.android.art/javalib/apache-xml.jar:/system/framework/framework.jar:/system/framework/framework-graphics.jar:/system/framework/ext.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/ims-common.jar:/apex/com.android.i18n/javalib/core-icu4j.jar:/system/framework/telephony-ext.jar\"" >> "$mnt/etc/profile"
 
+
+    #      UNCHROOT      #
+    do_unchroot()
+    {
+    echo "[INFO] Doing unchroot magic"
+    local unchroot="$mnt/sbin/unchroot"
+    echo '#!/bin/sh' > "${unchroot}"
+    echo 'if [ "$(whoami)" != "root" ]; then' >> "${unchroot}"
+    echo 'sudo $0 "$@"; exit $?' >> "${unchroot}"
+    echo 'fi' >> "${unchroot}"
+    echo 'chroot_exec=$(which chroot)' >> "${unchroot}"
+    echo "export PATH=$PATH" >> "${unchroot}"
+    echo "export BOOTCLASSPATH=$BOOTCLASSPATH" >> "${unchroot}"
+    echo "export ANDROID_DATA=$ANDROID_DATA" >> "${unchroot}"
+    echo "export EXTERNAL_STORAGE=$EXTERNAL_STORAGE" >> "${unchroot}"
+    echo "export ANDROID_STORAGE=$ANDROID_STORAGE" >> "${unchroot}"
+    echo 'if [ $# -eq 0 ]; then' >> "${unchroot}"
+    echo '$chroot_exec /proc/1/cwd su -' >> "${unchroot}"
+    echo 'else' >> "${unchroot}"
+    echo '$chroot_exec /proc/1/cwd "$@"' >> "${unchroot}"
+    echo 'fi' >> "${unchroot}"
+    chmod 755 "${unchroot}"
+    return 0
+    }
     # NETWORK SETTINGS #
-    $busybox sysctl -w net.ipv4.ip_forward=1
+    $busybox sysctl -w net.ipv4.ip_forward=1 &> /dev/null 2>&1
     echo "127.0.0.1		 localhost linux" > $mnt/etc/hosts
     echo "::1				 localhost ip6-localhost ip6-loopback" >> $mnt/etc/hosts
     echo "linux" > $mnt/proc/sys/kernel/hostname
-    echo "The Linux chroot has been started."
+    echo "[INFO] The Linux chroot has been started."
     if [ -f /sdcard/debug ]; then
-        echo " [!] Everytime you mount the linux chroot, please press ENTER to continue. (If chroot is already mounted, this won't prompt.)"
+        echo " [INFO] Everytime you mount the linux chroot, please press ENTER to continue. (If chroot is already mounted, this won't prompt.)"
         read
     fi
-    log "The Linux chroot has been started."
+    echo 'localhost' > "$mnt/etc/hostname"
+    log "[INFO] The Linux chroot has been started."
 
 }
 
 ############ STARTING ############
 
-echo "Mounting Linux Chroot..."
+echo "[INFO] Mounting Linux Chroot..."
 mount_linux_chroot
+do_sysv
+do_unchroot
 
 if [ -d "$mnt/usr" ]; then
-    echo "The Linux chroot should be already running!"
+    echo "[INFO] Booted"
 else
-    echo "Missing required folder, exit now...."
+    echo "[INFO] Missing required folder, exit now...."
     exit 1
 fi
